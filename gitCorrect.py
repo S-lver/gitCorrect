@@ -1,10 +1,49 @@
 #!/usr/bin/env python3
-"""gitCorrect — figure out what you meant when you typo a git subcommand."""
+"""gitCorrect — figure out what you meant when you typo a git subcommand or flag."""
 import os
 import re
 import subprocess
 import sys
 import difflib
+
+
+KNOWN_FLAGS = {
+    "config": ["--global", "--system", "--local", "--worktree", "--get",
+               "--get-all", "--get-regexp", "--unset", "--unset-all",
+               "--add", "--replace-all", "--list", "--edit",
+               "--name-only", "--show-origin", "--show-scope"],
+    "commit": ["--message", "--amend", "--all", "--patch", "--no-verify",
+               "--author", "--date", "--allow-empty", "--verbose"],
+    "log":    ["--oneline", "--graph", "--all", "--decorate", "--stat",
+               "--patch", "--pretty", "--author", "--since", "--until"],
+    "push":   ["--force", "--force-with-lease", "--set-upstream", "--tags",
+               "--all", "--delete", "--dry-run"],
+    "pull":   ["--rebase", "--no-rebase", "--ff-only", "--no-ff", "--all"],
+    "checkout": ["--branch", "--force", "--track", "--orphan", "--detach"],
+    "switch": ["--create", "--force-create", "--detach", "--track", "--orphan"],
+    "branch": ["--all", "--remotes", "--delete", "--move", "--copy",
+               "--list", "--verbose", "--set-upstream-to"],
+}
+
+SHORT_FLAGS = {
+    "commit": ["-m", "-a", "-p", "-n", "-v", "-e"],
+    "log":    ["-p", "-n", "-1"],
+    "checkout": ["-b", "-B", "-f", "-t"],
+    "switch": ["-c", "-C", "-f", "-t"],
+    "branch": ["-a", "-r", "-d", "-D", "-m", "-M", "-v", "-l"],
+    "push":   ["-f", "-u", "-d"],
+    "pull":   ["-f", "-t"],
+}
+
+DANGEROUS_SUBCOMMANDS = {
+    "reset", "clean", "rebase", "filter-branch", "filter-repo",
+    "reflog", "gc", "prune", "rm",
+}
+
+DANGEROUS_FLAGS = {
+    "--hard", "--force", "-f", "--mirror", "--delete", "-D",
+    "--expire", "--prune", "--no-verify",
+}
 
 
 def list_commands():
@@ -40,11 +79,65 @@ def suggest(typo, args, cmds):
         base = difflib.SequenceMatcher(None, typo, c).ratio()
         if len(typo) >= 3 and c.startswith(typo) and c != typo:
             base += 0.05
-        if base < 0.55:
+        if base < 0.35:
             continue
         scored.append((c, min(base + context_bonus(c, args), 0.99)))
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:3]
+
+
+def fix_flags(sub, flags):
+    """Correct long and short flag typos for known subcommands."""
+    long_known = KNOWN_FLAGS.get(sub, [])
+    short_known = SHORT_FLAGS.get(sub, [])
+
+    fixed = []
+    corrections = []
+    for f in flags:
+        # Long flags: --foo
+        if f.startswith("--"):
+            if f in long_known:
+                fixed.append(f)
+                continue
+            matches = difflib.get_close_matches(f, long_known, n=1, cutoff=0.7)
+            if matches:
+                corrections.append((f, matches[0]))
+                fixed.append(matches[0])
+            else:
+                fixed.append(f)
+            continue
+
+        # Short flags: -x or -xyz (combined)
+        if f.startswith("-") and len(f) > 1 and not f[1].isdigit():
+            # Don't touch if it's just a number-like arg or a known combined flag.
+            if f in short_known:
+                fixed.append(f)
+                continue
+            if len(f) == 2:
+                matches = difflib.get_close_matches(f, short_known, n=1, cutoff=0.7)
+                if matches:
+                    corrections.append((f, matches[0]))
+                    fixed.append(matches[0])
+                    continue
+            fixed.append(f)
+            continue
+
+        fixed.append(f)
+
+    return fixed, corrections
+
+
+def is_dangerous(sub, args):
+    if sub in DANGEROUS_SUBCOMMANDS:
+        return True
+    for a in args:
+        if a in DANGEROUS_FLAGS:
+            return True
+        if a.startswith("-") and not a.startswith("--") and len(a) > 1:
+            for ch in a[1:]:
+                if f"-{ch}" in DANGEROUS_FLAGS:
+                    return True
+    return False
 
 
 def run_git(args):
@@ -63,20 +156,51 @@ def main():
         run_git(args)
 
     hits = suggest(sub, rest, cmds)
+
+    # No candidates at all → hand off to git.
     if not hits:
         run_git(args)
 
-    cmd, score = hits[0]
+    best_cmd, best_score = hits[0]
+
+    # Strong suggestion → normal path.
+    if best_score >= 0.55:
+        cmd, score = best_cmd, best_score
+    else:
+        # Weak candidates only → show them, then defer to git.
+        print(f"git: '{sub}' is not a git command. No confident match. Maybe:",
+              file=sys.stderr)
+        for c, s in hits:
+            print(f"     {c:<15} ({s:.2f})", file=sys.stderr)
+        run_git(args)
+        return
+
+    # Fix flags before prompting.
+    fixed_rest, flag_fixes = fix_flags(cmd, rest)
+    danger = is_dangerous(cmd, fixed_rest)
+
     print(f"git: '{sub}' is not a git command. Did you mean '{cmd}'? "
           f"(score {score:.2f})", file=sys.stderr)
+    for old, new in flag_fixes:
+        print(f"     (also fixing {old} → {new})", file=sys.stderr)
+    if danger:
+        print("     ⚠  WARNING: this command can destroy work. "
+              "Type 'yes' to confirm.", file=sys.stderr)
+
+    preview = " ".join([cmd, *fixed_rest])
 
     try:
-        ans = input(f"Run 'git {cmd} {' '.join(rest)}'? [y/N] ").strip().lower()
+        if danger:
+            ans = input(f"Run 'git {preview}'? Type 'yes' to confirm: ").strip().lower()
+            confirmed = ans == "yes"
+        else:
+            ans = input(f"Run 'git {preview}'? [y/N] ").strip().lower()
+            confirmed = ans in ("y", "yes")
     except (EOFError, KeyboardInterrupt):
-        ans = ""
+        confirmed = False
 
-    if ans in ("y", "yes"):
-        run_git([cmd, *rest])
+    if confirmed:
+        run_git([cmd, *fixed_rest])
     run_git(args)
 
 

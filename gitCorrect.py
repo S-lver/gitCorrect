@@ -25,15 +25,6 @@ KNOWN_FLAGS = {
                "--list", "--verbose", "--set-upstream-to"],
 }
 
-SHORT_FLAGS = {
-    "commit": ["-m", "-a", "-p", "-n", "-v", "-e"],
-    "log":    ["-p", "-n", "-1"],
-    "checkout": ["-b", "-B", "-f", "-t"],
-    "switch": ["-c", "-C", "-f", "-t"],
-    "branch": ["-a", "-r", "-d", "-D", "-m", "-M", "-v", "-l"],
-    "push":   ["-f", "-u", "-d"],
-    "pull":   ["-f", "-t"],
-}
 
 DANGEROUS_SUBCOMMANDS = {
     "reset", "clean", "rebase", "filter-branch", "filter-repo",
@@ -77,8 +68,8 @@ def suggest(typo, args, cmds):
     scored = []
     for c in cmds:
         base = difflib.SequenceMatcher(None, typo, c).ratio()
-        if len(typo) >= 3 and c.startswith(typo) and c != typo:
-            base += 0.05
+        if c.startswith(typo) and c != typo:
+            base += 0.15
         if base < 0.35:
             continue
         scored.append((c, min(base + context_bonus(c, args), 0.99)))
@@ -87,43 +78,23 @@ def suggest(typo, args, cmds):
 
 
 def fix_flags(sub, flags):
-    """Correct long and short flag typos for known subcommands."""
+    """Correct long-flag typos for known subcommands."""
     long_known = KNOWN_FLAGS.get(sub, [])
-    short_known = SHORT_FLAGS.get(sub, [])
+    if not long_known:
+        return flags, []
 
     fixed = []
     corrections = []
     for f in flags:
-        # Long flags: --foo
-        if f.startswith("--"):
-            if f in long_known:
-                fixed.append(f)
-                continue
-            matches = difflib.get_close_matches(f, long_known, n=1, cutoff=0.7)
-            if matches:
-                corrections.append((f, matches[0]))
-                fixed.append(matches[0])
-            else:
-                fixed.append(f)
-            continue
-
-        # Short flags: -x or -xyz (combined)
-        if f.startswith("-") and len(f) > 1 and not f[1].isdigit():
-            # Don't touch if it's just a number-like arg or a known combined flag.
-            if f in short_known:
-                fixed.append(f)
-                continue
-            if len(f) == 2:
-                matches = difflib.get_close_matches(f, short_known, n=1, cutoff=0.7)
-                if matches:
-                    corrections.append((f, matches[0]))
-                    fixed.append(matches[0])
-                    continue
+        if not f.startswith("--") or f in long_known:
             fixed.append(f)
             continue
-
-        fixed.append(f)
-
+        matches = difflib.get_close_matches(f, long_known, n=1, cutoff=0.7)
+        if matches:
+            corrections.append((f, matches[0]))
+            fixed.append(matches[0])
+        else:
+            fixed.append(f)
     return fixed, corrections
 
 
@@ -175,7 +146,7 @@ def main():
         run_git(args)
         return
 
-    # Fix flags before prompting.
+    # Fix long flags before prompting.
     fixed_rest, flag_fixes = fix_flags(cmd, rest)
     danger = is_dangerous(cmd, fixed_rest)
 

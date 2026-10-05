@@ -78,7 +78,11 @@ def suggest(typo, args, cmds):
 
 
 def fix_flags(sub, flags):
-    """Correct long-flag typos for known subcommands."""
+    """Correct long-flag typos for known subcommands.
+
+    Only flags NOT already in our known list get fuzzy-matched. This keeps
+    valid flags untouched even when we don't know about every git flag.
+    """
     long_known = KNOWN_FLAGS.get(sub, [])
     if not long_known:
         return flags, []
@@ -90,7 +94,7 @@ def fix_flags(sub, flags):
             fixed.append(f)
             continue
         matches = difflib.get_close_matches(f, long_known, n=1, cutoff=0.7)
-        if matches:
+        if matches and matches[0] != f:
             corrections.append((f, matches[0]))
             fixed.append(matches[0])
         else:
@@ -115,45 +119,12 @@ def run_git(args):
     sys.exit(subprocess.call(["git", *args]))
 
 
-def main():
-    args = sys.argv[1:]
-    if not args or args[0].startswith("-"):
-        run_git(args)
-
-    sub, rest = args[0], args[1:]
-    cmds = list_commands()
-
-    if sub in cmds:
-        run_git(args)
-
-    hits = suggest(sub, rest, cmds)
-
-    # No candidates at all → hand off to git.
-    if not hits:
-        run_git(args)
-
-    best_cmd, best_score = hits[0]
-
-    # Strong suggestion → normal path.
-    if best_score >= 0.55:
-        cmd, score = best_cmd, best_score
-    else:
-        # Weak candidates only → show them, then defer to git.
-        print(f"git: '{sub}' is not a git command. No confident match. Maybe:",
-              file=sys.stderr)
-        for c, s in hits:
-            print(f"     {c:<15} ({s:.2f})", file=sys.stderr)
-        run_git(args)
-        return
-
-    # Fix long flags before prompting.
-    fixed_rest, flag_fixes = fix_flags(cmd, rest)
+def prompt_and_run(cmd, fixed_rest, flag_fixes, header):
     danger = is_dangerous(cmd, fixed_rest)
 
-    print(f"git: '{sub}' is not a git command. Did you mean '{cmd}'? "
-          f"(score {score:.2f})", file=sys.stderr)
+    print(header, file=sys.stderr)
     for old, new in flag_fixes:
-        print(f"     (also fixing {old} → {new})", file=sys.stderr)
+        print(f"     (fixing {old} → {new})", file=sys.stderr)
     if danger:
         print("     ⚠  WARNING: this command can destroy work. "
               "Type 'yes' to confirm.", file=sys.stderr)
@@ -170,7 +141,48 @@ def main():
     except (EOFError, KeyboardInterrupt):
         confirmed = False
 
-    if confirmed:
+    return confirmed
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0].startswith("-"):
+        run_git(args)
+
+    sub, rest = args[0], args[1:]
+    cmds = list_commands()
+
+    # Case 1: valid subcommand. Check for fixable flag typos.
+    if sub in cmds:
+        fixed_rest, flag_fixes = fix_flags(sub, rest)
+        if not flag_fixes:
+            run_git(args)
+        header = f"git: fixing flag typos in '{sub}':"
+        if prompt_and_run(sub, fixed_rest, flag_fixes, header):
+            run_git([sub, *fixed_rest])
+        run_git(args)
+
+    # Case 2: typo'd subcommand. Suggest a correction.
+    hits = suggest(sub, rest, cmds)
+    if not hits:
+        run_git(args)
+
+    best_cmd, best_score = hits[0]
+
+    if best_score < 0.55:
+        print(f"git: '{sub}' is not a git command. No confident match. Maybe:",
+              file=sys.stderr)
+        for c, s in hits:
+            print(f"     {c:<15} ({s:.2f})", file=sys.stderr)
+        run_git(args)
+        return
+
+    cmd, score = best_cmd, best_score
+    fixed_rest, flag_fixes = fix_flags(cmd, rest)
+    header = (f"git: '{sub}' is not a git command. "
+              f"Did you mean '{cmd}'? (score {score:.2f})")
+
+    if prompt_and_run(cmd, fixed_rest, flag_fixes, header):
         run_git([cmd, *fixed_rest])
     run_git(args)
 
